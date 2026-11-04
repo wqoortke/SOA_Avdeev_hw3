@@ -1,0 +1,207 @@
+name: flight-booking
+
+x-app: &app
+  build: .
+  image: flight-booking-app:local
+  restart: unless-stopped
+
+x-sentinel: &sentinel
+  image: redis:7.4-alpine
+  entrypoint: ["sh", "/scripts/sentinel.sh"]
+  volumes:
+    - ./redis/sentinel.sh:/scripts/sentinel.sh:ro
+  depends_on:
+    redis-master:
+      condition: service_healthy
+    redis-replica:
+      condition: service_healthy
+  restart: unless-stopped
+  healthcheck:
+    test: ["CMD", "redis-cli", "-p", "26379", "ping"]
+    interval: 3s
+    timeout: 2s
+    retries: 20
+
+services:
+  flight-db:
+    image: postgres:16-alpine
+    environment:
+      POSTGRES_DB: flights
+      POSTGRES_USER: flights
+      POSTGRES_PASSWORD: ${FLIGHT_DB_PASSWORD:-flight-local-password}
+    volumes:
+      - flight-data:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U flights -d flights"]
+      interval: 2s
+      timeout: 3s
+      retries: 30
+
+  booking-db:
+    image: postgres:16-alpine
+    environment:
+      POSTGRES_DB: bookings
+      POSTGRES_USER: bookings
+      POSTGRES_PASSWORD: ${BOOKING_DB_PASSWORD:-booking-local-password}
+    volumes:
+      - booking-data:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U bookings -d bookings"]
+      interval: 2s
+      timeout: 3s
+      retries: 30
+
+  flight-migrate:
+    image: flyway/flyway:10-alpine
+    command: -connectRetries=30 migrate
+    environment:
+      FLYWAY_URL: jdbc:postgresql://flight-db:5432/flights
+      FLYWAY_USER: flights
+      FLYWAY_PASSWORD: ${FLIGHT_DB_PASSWORD:-flight-local-password}
+    volumes:
+      - ./migrations/flight:/flyway/sql:ro
+    depends_on:
+      flight-db:
+        condition: service_healthy
+
+  booking-migrate:
+    image: flyway/flyway:10-alpine
+    command: -connectRetries=30 migrate
+    environment:
+      FLYWAY_URL: jdbc:postgresql://booking-db:5432/bookings
+      FLYWAY_USER: bookings
+      FLYWAY_PASSWORD: ${BOOKING_DB_PASSWORD:-booking-local-password}
+    volumes:
+      - ./migrations/booking:/flyway/sql:ro
+    depends_on:
+      booking-db:
+        condition: service_healthy
+
+  redis-master:
+    image: redis:7.4-alpine
+    entrypoint: ["sh", "/scripts/redis.sh"]
+    environment:
+      REDIS_HOST: redis-master
+    volumes:
+      - redis-master-data:/data
+      - ./redis/redis.sh:/scripts/redis.sh:ro
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 2s
+      timeout: 2s
+      retries: 30
+
+  redis-replica:
+    image: redis:7.4-alpine
+    entrypoint: ["sh", "/scripts/redis.sh"]
+    environment:
+      REDIS_HOST: redis-replica
+      INITIAL_REPLICA: "yes"
+    volumes:
+      - redis-replica-data:/data
+      - ./redis/redis.sh:/scripts/redis.sh:ro
+    depends_on:
+      redis-master:
+        condition: service_healthy
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 2s
+      timeout: 2s
+      retries: 30
+
+  sentinel-1:
+    <<: *sentinel
+    volumes:
+      - ./redis/sentinel.sh:/scripts/sentinel.sh:ro
+      - sentinel-1-data:/data
+    environment:
+      SENTINEL_HOST: sentinel-1
+  sentinel-2:
+    <<: *sentinel
+    volumes:
+      - ./redis/sentinel.sh:/scripts/sentinel.sh:ro
+      - sentinel-2-data:/data
+    environment:
+      SENTINEL_HOST: sentinel-2
+  sentinel-3:
+    <<: *sentinel
+    volumes:
+      - ./redis/sentinel.sh:/scripts/sentinel.sh:ro
+      - sentinel-3-data:/data
+    environment:
+      SENTINEL_HOST: sentinel-3
+
+  flight-service:
+    <<: *app
+    command: python -m flight_service.server
+    environment:
+      DATABASE_URL: postgresql://flights:${FLIGHT_DB_PASSWORD:-flight-local-password}@flight-db:5432/flights
+      GRPC_API_KEY: ${GRPC_API_KEY:-homework-local-service-key}
+      REDIS_SENTINELS: sentinel-1:26379,sentinel-2:26379,sentinel-3:26379
+      REDIS_MASTER_NAME: flight-cache
+      CACHE_TTL_SECONDS: ${CACHE_TTL_SECONDS:-300}
+    depends_on:
+      flight-migrate:
+        condition: service_completed_successfully
+      sentinel-1:
+        condition: service_healthy
+      sentinel-2:
+        condition: service_healthy
+      sentinel-3:
+        condition: service_healthy
+    healthcheck:
+      test: ["CMD", "python", "scripts/grpc_health.py"]
+      interval: 5s
+      timeout: 4s
+      retries: 20
+
+  booking-service:
+    <<: *app
+    command: uvicorn booking_service.main:app --host 0.0.0.0 --port 8080
+    ports:
+      - "8080:8080"
+    environment:
+      DATABASE_URL: postgresql://bookings:${BOOKING_DB_PASSWORD:-booking-local-password}@booking-db:5432/bookings
+      FLIGHT_GRPC_TARGET: flight-service:50051
+      GRPC_API_KEY: ${GRPC_API_KEY:-homework-local-service-key}
+      GRPC_TIMEOUT_SECONDS: ${GRPC_TIMEOUT_SECONDS:-2}
+      CB_FAILURE_THRESHOLD: ${CB_FAILURE_THRESHOLD:-5}
+      CB_RESET_SECONDS: ${CB_RESET_SECONDS:-15}
+      CB_WINDOW_SECONDS: ${CB_WINDOW_SECONDS:-60}
+      RECOVERY_INTERVAL_SECONDS: ${RECOVERY_INTERVAL_SECONDS:-5}
+      RECOVERY_AGE_SECONDS: ${RECOVERY_AGE_SECONDS:-30}
+    depends_on:
+      booking-migrate:
+        condition: service_completed_successfully
+      flight-service:
+        condition: service_healthy
+    healthcheck:
+      test: ["CMD", "python", "-c", "import urllib.request; urllib.request.urlopen('http://127.0.0.1:8080/health', timeout=2)"]
+      interval: 5s
+      timeout: 3s
+      retries: 20
+
+  tests:
+    <<: *app
+    restart: "no"
+    profiles: ["test"]
+    command: pytest -v tests
+    environment:
+      BASE_URL: http://booking-service:8080
+      FLIGHT_GRPC_TARGET: flight-service:50051
+      GRPC_API_KEY: ${GRPC_API_KEY:-homework-local-service-key}
+      FLIGHT_TEST_DSN: postgresql://flights:${FLIGHT_DB_PASSWORD:-flight-local-password}@flight-db:5432/flights
+      BOOKING_TEST_DSN: postgresql://bookings:${BOOKING_DB_PASSWORD:-booking-local-password}@booking-db:5432/bookings
+      REDIS_SENTINELS: sentinel-1:26379,sentinel-2:26379,sentinel-3:26379
+    depends_on:
+      booking-service:
+        condition: service_healthy
+
+volumes:
+  flight-data:
+  booking-data:
+  redis-master-data:
+  redis-replica-data:
+  sentinel-1-data:
+  sentinel-2-data:
+  sentinel-3-data:
